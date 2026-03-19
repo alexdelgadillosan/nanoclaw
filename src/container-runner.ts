@@ -26,6 +26,7 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -221,21 +222,42 @@ function buildContainerArgs(
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // Route API traffic through the credential proxy (containers never see real secrets)
-  args.push(
-    '-e',
-    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
-  );
+  // Forward model overrides
+  const envOverrides = readEnvFile([
+    'ANTHROPIC_MODEL',
+    'ANTHROPIC_SMALL_FAST_MODEL',
+    'ANTHROPIC_BASE_URL',
+    'ANTHROPIC_API_KEY',
+  ]);
 
-  // Mirror the host's auth method with a placeholder value.
-  // API key mode: SDK sends x-api-key, proxy replaces with real key.
-  // OAuth mode:   SDK exchanges placeholder token for temp API key,
-  //               proxy injects real OAuth token on that exchange request.
-  const authMode = detectAuthMode();
-  if (authMode === 'api-key') {
-    args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+  if (envOverrides.ANTHROPIC_BASE_URL) {
+    // Custom API endpoint (e.g. DeepSeek): bypass the credential proxy and pass
+    // credentials directly using ANTHROPIC_AUTH_TOKEN. Claude Code skips its
+    // internal Claude-model validation when ANTHROPIC_API_KEY is absent.
+    args.push('-e', `ANTHROPIC_BASE_URL=${envOverrides.ANTHROPIC_BASE_URL}`);
+    args.push('-e', `ANTHROPIC_AUTH_TOKEN=${envOverrides.ANTHROPIC_API_KEY}`);
+    args.push('-e', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1');
   } else {
-    args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+    // Standard Anthropic API: route through credential proxy so containers
+    // never see real secrets.
+    args.push(
+      '-e',
+      `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
+    );
+    // Mirror the host's auth method with a placeholder value.
+    const authMode = detectAuthMode();
+    if (authMode === 'api-key') {
+      args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+    } else {
+      args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+    }
+  }
+
+  if (envOverrides.ANTHROPIC_MODEL) {
+    args.push('-e', `ANTHROPIC_MODEL=${envOverrides.ANTHROPIC_MODEL}`);
+  }
+  if (envOverrides.ANTHROPIC_SMALL_FAST_MODEL) {
+    args.push('-e', `ANTHROPIC_SMALL_FAST_MODEL=${envOverrides.ANTHROPIC_SMALL_FAST_MODEL}`);
   }
 
   // Runtime-specific args for host gateway resolution
